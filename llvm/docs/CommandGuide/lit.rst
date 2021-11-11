@@ -104,13 +104,33 @@ OUTPUT OPTIONS
  Show more information about all tests, for example the entire test
  commandline and output.
 
+.. option:: -o PATH, --output PATH
+
+ Write test results to the provided path.
+
 .. option:: --no-progress-bar
 
  Do not use curses based progress bar.
 
+.. option:: --show-excluded
+
+ Show the names of excluded tests.
+
+.. option:: --show-skipped
+
+ Show the names of skipped tests.
+
 .. option:: --show-unsupported
 
  Show the names of unsupported tests.
+
+.. option:: --show-pass
+
+ Show the names of passed tests.
+
+.. option:: --show-flakypass
+
+ Show the names of passed with retry tests.
 
 .. option:: --show-xfail
 
@@ -152,6 +172,26 @@ EXECUTION OPTIONS
  Track the wall time individual tests take to execute and includes the results
  in the summary output.  This is useful for determining which tests in a test
  suite take the most time to execute.
+
+.. option:: --no-execute
+
+ Don't execute any tests (assume PASS).
+
+.. option:: --xunit-xml-output XUNIT_XML_OUTPUT
+
+ Write XUnit-compatible XML test reports to the specified file.
+
+.. option:: --resultdb-output RESULTDB_OUTPUT
+
+ Write LuCI ResuldDB compatible JSON to the specified file.
+
+.. option:: --time-trace-output TIME_TRACE_OUTPUT
+
+ Write Chrome tracing compatible JSON to the specified file.
+
+.. option::  --allow-empty-runs
+
+ Do not fail the run if all tests are filtered out.
 
 .. option:: --ignore-fail
 
@@ -303,6 +343,10 @@ ADDITIONAL OPTIONS
 .. option:: --show-tests
 
  List all of the discovered tests and exit.
+
+.. option:: --show-used-features
+
+ List all of the used features in tests and exit.
 
 EXIT STATUS
 -----------
