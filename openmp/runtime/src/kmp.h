@@ -115,7 +115,6 @@ typedef unsigned int kmp_hwloc_depth_t;
 #include "kmp_debug.h"
 #include "kmp_lock.h"
 #include "kmp_version.h"
-#include "kmp_barrier.h"
 #if USE_DEBUGGER
 #include "kmp_debugger.h"
 #endif
@@ -730,6 +729,8 @@ public:
     virtual void clear(int i) {}
     // Zero out entire mask
     virtual void zero() {}
+    // Count the mask
+    virtual int count() const { return 0; }
     // Copy src into this mask
     virtual void copy(const Mask *src) {}
     // this &= rhs
@@ -1991,6 +1992,7 @@ typedef enum kmp_bar_pat { /* Barrier communication patterns */
                                                 branching factor 2^n */
                            bp_hierarchical_bar = 3, /* Machine hierarchy tree */
                            bp_dist_bar = 4, /* Distributed barrier */
+                           bp_hard_bar = 5, /* Hardware barrier */
                            bp_last_bar /* Placeholder to mark the end */
 } kmp_bar_pat_e;
 
@@ -2789,6 +2791,7 @@ typedef struct KMP_ALIGN_CACHE kmp_base_info {
   std::atomic<bool> th_blocking;
 #endif
   kmp_cg_root_t *th_cg_roots; // list of cg_roots associated with this thread
+  int th_hard_barrier_window; // used for hardware barrier
 } kmp_base_info_t;
 
 typedef union KMP_ALIGN_CACHE kmp_info {
@@ -2835,6 +2838,9 @@ typedef int (*launch_t)(int gtid);
   (2 * CACHE_LINE - ((3 * KMP_PTR_SKIP + 2 * sizeof(int)) % CACHE_LINE))
 #endif
 #define KMP_INLINE_ARGV_ENTRIES (int)(KMP_INLINE_ARGV_BYTES / KMP_PTR_SKIP)
+
+class distributedBarrier;
+class hardBarrier;
 
 typedef struct KMP_ALIGN_CACHE kmp_base_team {
   // Synchronization Data
@@ -2929,6 +2935,7 @@ typedef struct KMP_ALIGN_CACHE kmp_base_team {
   void *t_stack_id; // team specific stack stitching id (for ittnotify)
 #endif /* USE_ITT_BUILD */
   distributedBarrier *b; // Distributed barrier data associated with team
+  hardBarrier *h; // Hard barrier data associated with team
 } kmp_base_team_t;
 
 union KMP_ALIGN_CACHE kmp_team {
@@ -3632,6 +3639,8 @@ extern void __kmp_aux_display_affinity(int gtid, const char *format);
 extern void __kmp_cleanup_hierarchy();
 extern void __kmp_get_hierarchy(kmp_uint32 nproc, kmp_bstate_t *thr_bar);
 
+extern bool __kmp_check_places_for_hard_barrier();
+
 #if KMP_USE_FUTEX
 
 extern int __kmp_futex_determine_capable(void);
@@ -3720,6 +3729,8 @@ extern int __kmp_barrier(enum barrier_type bt, int gtid, int is_split,
                          void (*reduce)(void *, void *));
 extern void __kmp_end_split_barrier(enum barrier_type bt, int gtid);
 extern int __kmp_barrier_gomp_cancel(int gtid);
+
+extern void __kmp_hard_barrier_wakeup_soft(kmp_info_t *master);
 
 /*!
  * Tell the fork call which compiler generated the fork call, and therefore how
@@ -4198,6 +4209,8 @@ extern void __kmp_hidden_helper_main_thread_wait();
 extern void __kmp_hidden_helper_worker_thread_wait();
 extern void __kmp_hidden_helper_worker_thread_signal();
 extern void __kmp_hidden_helper_main_thread_release();
+
+extern int __kmp_get_online_cores();
 
 // Check whether a given thread is a hidden helper thread
 #define KMP_HIDDEN_HELPER_THREAD(gtid)                                         \

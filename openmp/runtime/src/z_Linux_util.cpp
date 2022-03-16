@@ -2729,4 +2729,11 @@ void __kmp_hidden_helper_threads_deinitz_release() {
 }
 #endif // KMP_OS_LINUX
 
+#ifdef KMP_OS_LINUX
+int __kmp_get_online_cores() {
+  int r;
+  __kmp_type_convert(sysconf(_SC_NPROCESSORS_ONLN), &(r));
+  return r;
+}
+#endif
 // end of file //

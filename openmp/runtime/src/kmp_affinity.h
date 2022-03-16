@@ -52,6 +52,7 @@ public:
     int next(int previous) const override {
       return hwloc_bitmap_next(mask, previous);
     }
+    int count() const override { return 0; }
     int get_system_affinity(bool abort_on_error) override {
       KMP_ASSERT2(KMP_AFFINITY_CAPABLE(),
                   "Illegal get affinity operation when not capable");
@@ -290,6 +291,13 @@ class KMPNativeAffinity : public KMPAffinity {
       mask_size_type e = get_num_mask_types();
       for (mask_size_type i = 0; i < e; ++i)
         mask[i] = (mask_t)0;
+    }
+    int count() const override {
+      int count = 0;
+      for (int i = begin(); i < end(); i = next(i)) {
+        count++;
+      }
+      return count;
     }
     void copy(const KMPAffinity::Mask *src) override {
       const Mask *convert = static_cast<const Mask *>(src);

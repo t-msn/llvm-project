@@ -13,6 +13,7 @@
 #include "kmp.h"
 #include "kmp_affinity.h"
 #include "kmp_atomic.h"
+#include "kmp_barrier.h"
 #if KMP_USE_HIER_SCHED
 #include "kmp_dispatch_hier.h"
 #endif
@@ -1714,7 +1715,9 @@ static void __kmp_stg_parse_barrier_pattern(char const *name, char const *value,
   const char *var;
   /* ---------- Barrier method control ------------ */
 
-  static int dist_req = 0, non_dist_req = 0;
+  static int dist_req = 0;
+  static int hard_req = 0;
+  static int other_req = 0;
   static bool warn = 1;
   for (int i = bs_plain_barrier; i < bs_last_barrier; i++) {
     var = __kmp_barrier_pattern_env_name[i];
@@ -1729,8 +1732,10 @@ static void __kmp_stg_parse_barrier_pattern(char const *name, char const *value,
                                       ',')) {
           if (j == bp_dist_bar) {
             dist_req++;
+          } else if (j == bp_hard_bar) {
+            hard_req++;
           } else {
-            non_dist_req++;
+            other_req++;
           }
           __kmp_barrier_gather_pattern[i] = (kmp_bar_pat_e)j;
           break;
@@ -1748,8 +1753,10 @@ static void __kmp_stg_parse_barrier_pattern(char const *name, char const *value,
           if (__kmp_str_match(__kmp_barrier_pattern_name[j], 1, comma + 1)) {
             if (j == bp_dist_bar) {
               dist_req++;
+            } else if (j == bp_hard_bar) {
+              hard_req++;
             } else {
-              non_dist_req++;
+              other_req++;
             }
             __kmp_barrier_release_pattern[i] = (kmp_bar_pat_e)j;
             break;
@@ -1767,9 +1774,8 @@ static void __kmp_stg_parse_barrier_pattern(char const *name, char const *value,
   }
   if (dist_req != 0) {
     // set all barriers to dist
-    if ((non_dist_req != 0) && warn) {
-      KMP_INFORM(BarrierPatternOverride, name,
-                 __kmp_barrier_pattern_name[bp_dist_bar]);
+    if ((hard_req + other_req != 0) && warn) {
+      KMP_INFORM(BarrierPatternOverride, "dist");
       warn = 0;
     }
     for (int i = bs_plain_barrier; i < bs_last_barrier; i++) {
@@ -1777,6 +1783,16 @@ static void __kmp_stg_parse_barrier_pattern(char const *name, char const *value,
         __kmp_barrier_release_pattern[i] = bp_dist_bar;
       if (__kmp_barrier_gather_pattern[i] != bp_dist_bar)
         __kmp_barrier_gather_pattern[i] = bp_dist_bar;
+    }
+  } else if (hard_req != 0) {
+    // set all barriers to hard
+    if (other_req != 0 && warn) {
+      KMP_INFORM(BarrierPatternOverride, "hard");
+      warn = 0;
+    }
+    for (int i = bs_plain_barrier; i < bs_last_barrier; i++) {
+      __kmp_barrier_release_pattern[i] = bp_hard_bar;
+      __kmp_barrier_gather_pattern[i] = bp_hard_bar;
     }
   }
 } // __kmp_stg_parse_barrier_pattern

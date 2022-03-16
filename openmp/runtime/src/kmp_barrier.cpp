@@ -1734,6 +1734,817 @@ static void __kmp_hierarchical_barrier_release(
                 gtid, team->t.t_id, tid, bt));
 }
 
+//*****************************************************//
+// hardware barrier
+int hardBarrier::NUM_GROUPS = 0;
+int hardBarrier::CORES_PER_GROUP = 0;
+
+int hardBarrier::barrier_alloc(kmp_info_t *this_thr, int nthreads) {
+  // can be reallocated when team size is changed
+  if (is_barrier_allocated()) {
+    this->barrier_free();
+  }
+
+  int offset = this_thr->th.th_affin_mask->begin();
+  KMP_DEBUG_ASSERT(this_thr->th.th_affin_mask->count() == 1);
+
+  this->primary_core = offset;
+  if ((offset % CORES_PER_GROUP) + nthreads > CORES_PER_GROUP) {
+    this->is_hybrid = true;
+  } else {
+    this->is_hybrid = false;
+  }
+
+  // we already checked that all threads is packed closely
+  // from primary core in __kmp_can_use_hard_barrier
+  int group;
+  int first_group = (offset / CORES_PER_GROUP);
+  for (group = 0; group < NUM_GROUPS && nthreads > 0; group++) {
+    int nthreads_in_group;
+    if (group == 0) {
+      // handling for when the primary's core is not the first one in the group
+      nthreads_in_group = CORES_PER_GROUP - (offset % CORES_PER_GROUP);
+      if (nthreads_in_group > nthreads)
+        nthreads_in_group = nthreads;
+    } else {
+      nthreads_in_group =
+          (nthreads > CORES_PER_GROUP) ? CORES_PER_GROUP : nthreads;
+    }
+
+    int _group = (group + first_group) % NUM_GROUPS;
+
+    // serach free bb
+    int bb;
+    for (bb = 0;; bb++) {
+      int ret, fd;
+      char buf[BUF_SIZE];
+      ssize_t n;
+
+      KMP_SNPRINTF(buf, BUF_SIZE, "%s/group%d/barrier%d/masks", SYSFS_ROOT,
+                   _group, bb);
+      fd = open(buf, O_WRONLY);
+      if (fd < 0) {
+        // no more available barrier
+        this->num_groups = group;
+        barrier_free();
+        return -1;
+      }
+
+      n = KMP_SNPRINTF(buf, BUF_SIZE, "%d-%d", offset,
+                       offset + nthreads_in_group - 1);
+      ret = write(fd, buf, n + 1);
+      close(fd);
+      if (ret > 0) {
+        // success
+        break;
+      }
+    }
+
+    KA_TRACE(10,
+             ("hardBarrier::barrier_alloc. allocate bb: %d/%d\n", bb, _group));
+
+    this->group[group] = _group;
+    this->bb[group] = bb;
+    this->threads_in_group[group] = nthreads_in_group;
+
+    // set next start position
+    offset += nthreads_in_group;
+    nthreads -= nthreads_in_group;
+  }
+  this->num_groups = group;
+
+  return 0;
+}
+
+void hardBarrier::barrier_free() {
+  if (!is_barrier_allocated()) {
+    return;
+  }
+
+  for (int group = 0; group < this->num_groups && this->group[group] >= 0;
+       group++) {
+    char buf[BUF_SIZE];
+    int ret, fd;
+    KMP_SNPRINTF(buf, BUF_SIZE, "%s/group%d/barrier%d/masks", SYSFS_ROOT,
+                 this->group[group], this->bb[group]);
+    fd = open(buf, O_WRONLY);
+    // open error shoud not happen here
+    KMP_ASSERT(fd > 0);
+
+    buf[0] = '\0';
+    ret = write(fd, buf, 1);
+    // write error shoud not happen here
+    KMP_ASSERT(ret > 0);
+    close(fd);
+
+    KA_TRACE(10, ("hardBarrier::barrier_free. free bb: %d/%d\n",
+                  this->group[group], this->bb[group]));
+
+    this->bb[group] = -1;
+    this->group[group] = -1;
+    this->threads_in_group[group] = 0;
+    for (int i = 0; i < CORES_PER_GROUP; i++) {
+      this->barrier_window[group][i] = -1;
+    }
+  }
+  this->num_groups = -1;
+}
+
+void hardBarrier::get_window(kmp_info_t *this_thr, int tid) {
+  int group = get_group_from_tid(tid);
+  int id = get_window_index_from_tid(tid);
+
+  int bb = this->bb[group];
+  group = this->group[group];
+
+  if (this->barrier_window[group][id] != -1) {
+    // already assigned. restore window number
+    this_thr->th.th_hard_barrier_window = this->barrier_window[group][id];
+    return;
+  }
+
+  KMP_DEBUG_ASSERT(group >= 0 && bb >= 0);
+
+  char buf[BUF_SIZE];
+  int ret, fd;
+
+  // get window number
+  KMP_SNPRINTF(buf, BUF_SIZE, "%s/group%d/barrier%d/user", SYSFS_ROOT, group,
+               bb);
+  fd = open(buf, O_RDONLY);
+  // open error shoud not happen here
+  KMP_ASSERT(fd > 0);
+
+  ret = read(fd, buf, BUF_SIZE);
+  // write error shoud not happen here
+  KMP_ASSERT(ret > 0);
+  buf[ret] = '\0';
+
+  int window;
+  ret = KMP_SSCANF(buf, "%d", &window);
+  KMP_ASSERT(ret > 0);
+
+  close(fd);
+
+  KA_TRACE(10, ("hardBarrier::get_window. bb: %d/%d, tid: %d, window: %d\n",
+                group, bb, window));
+
+  /*
+   * It would  be possible barrier window number to be used for this
+   * thread might change when nest is used. Keep window number in team
+   */
+  this->barrier_window[group][id] = window;
+  this_thr->th.th_hard_barrier_window = window;
+}
+
+#define SYNC(reg)                                                              \
+  asm volatile("mrs x1, " #reg "\n\t"                                          \
+               "mvn x1, x1\n\t"                                                \
+               "and x1, x1, #1\n\t"                                            \
+               "msr " #reg ", x1\n\t"                                          \
+                                                                               \
+               "sevl\n\t"                                                      \
+                                                                               \
+               "1:mrs x2, " #reg "\n\t"                                        \
+               "and x2, x2, #1\n\t"                                            \
+               "cmp x1, x2\n\t"                                                \
+                                                                               \
+               "beq 2f\n\t"                                                    \
+               "b 1b\n\t"                                                      \
+                                                                               \
+               "2:\n\t"                                                        \
+               :                                                               \
+               :                                                               \
+               : "x1", "x2", "cc", "memory")
+
+// same as above but wait event by wfe
+#define SYNC_WFE(reg)                                                          \
+  asm volatile("mrs x1, " #reg "\n\t"                                          \
+               "mvn x1, x1\n\t"                                                \
+               "and x1, x1, #1\n\t"                                            \
+               "msr " #reg ", x1\n\t"                                          \
+                                                                               \
+               "sevl\n\t"                                                      \
+                                                                               \
+               "1:mrs x2, " #reg "\n\t"                                        \
+               "and x2, x2, #1\n\t"                                            \
+               "cmp x1, x2\n\t"                                                \
+                                                                               \
+               "beq 2f\n\t"                                                    \
+               "wfe\n\t"                                                       \
+               "b 1b\n\t"                                                      \
+                                                                               \
+               "2:\n\t"                                                        \
+               :                                                               \
+               :                                                               \
+               : "x1", "x2", "cc", "memory")
+
+// update (negate) own's BST bit
+#define UPDATE_BST(reg, val)                                                   \
+  asm volatile("mrs x1, " #reg "\n\t"                                          \
+               "mvn x1, x1\n\t"                                                \
+               "and x1, x1, #1\n\t"                                            \
+               "msr " #reg ", x1\n\t"                                          \
+                                                                               \
+               "sevl\n\t"                                                      \
+               "mov %x[val], x1\n\t"                                           \
+               : [val] "=r"(val)                                               \
+               :                                                               \
+               : "x1", "cc", "memory")
+
+// check if LBSY bit has been changed
+// (when all core has udpated BST, LBSY changes)
+#define CHECK_LBSY(reg, val, completed)                                        \
+  asm volatile("mrs x2, " #reg "\n\t"                                          \
+               "and x2, x2, #1\n\t"                                            \
+               "cmp %x[val], x2\n\t"                                           \
+               "beq 1f\n\t"                                                    \
+                                                                               \
+               "mov %x[comp], #0\n\t"                                          \
+               "b 2f\n\t"                                                      \
+                                                                               \
+               "1:\n\t"                                                        \
+               "mov %x[comp], #1\n\t"                                          \
+                                                                               \
+               "2:\n\t"                                                        \
+               : [comp] "=r"(completed)                                        \
+               : [val] "r"(val)                                                \
+               : "x2", "cc", "memory")
+
+// same as above but first wait event by wfe
+#define CHECK_LBSY_WFE(reg, val, completed)                                    \
+  asm volatile("wfe\n\t"                                                       \
+               "mrs x2, " #reg "\n\t"                                          \
+               "and x2, x2, #1\n\t"                                            \
+               "cmp %x[val], x2\n\t"                                           \
+               "beq 1f\n\t"                                                    \
+                                                                               \
+               "mov %x[comp], #0\n\t"                                          \
+               "b 2f\n\t"                                                      \
+                                                                               \
+               "1:\n\t"                                                        \
+               "mov %x[comp], #1\n\t"                                          \
+                                                                               \
+               "2:\n\t"                                                        \
+               : [comp] "=r"(completed)                                        \
+               : [val] "r"(val)                                                \
+               : "x2", "cc", "memory")
+
+// task handling is based on __kmp_wait_template
+void hardBarrier::sync(kmp_info_t *this_thr, int final_spin, int gtid,
+                       int tid USE_ITT_BUILD_ARG(void *itt_sync_obj)) {
+
+  int window = this_thr->th.th_hard_barrier_window;
+
+#if KMP_STATS_ENABLED
+  stats_state_e thread_state = KMP_GET_THREAD_STATE();
+#endif
+
+#if OMPT_SUPPORT
+  ompt_state_t ompt_entry_state;
+  ompt_data_t *tId;
+  if (ompt_enabled.enabled) {
+    ompt_entry_state = this_thr->th.ompt_thread_info.state;
+    if (!final_spin || ompt_entry_state != ompt_state_wait_barrier_implicit ||
+        KMP_MASTER_TID(this_thr->th.th_info.ds.ds_tid)) {
+      ompt_lw_taskteam_t *team = NULL;
+      if (this_thr->th.th_team)
+        team = this_thr->th.th_team->t.ompt_serialized_team_info;
+      if (team) {
+        tId = &(team->ompt_task_info.task_data);
+      } else {
+        tId = OMPT_CUR_TASK_DATA(this_thr);
+      }
+    } else {
+      tId = &(this_thr->th.ompt_thread_info.task_data);
+    }
+    if (final_spin && this_thr->th.th_task_team == NULL) {
+      // implicit task is done. Either no taskqueue, or task-team finished
+      __ompt_implicit_task_end(this_thr, ompt_entry_state, tId);
+    }
+  }
+#endif
+
+  if (__kmp_tasking_mode == tskm_immediate_exec) {
+    // shortcut route when there is notask
+    if (__kmp_dflt_blocktime != KMP_MAX_BLOCKTIME) {
+      switch (window) {
+      case 0:
+        SYNC_WFE(s3_3_c15_c15_0);
+        break;
+      case 1:
+        SYNC_WFE(s3_3_c15_c15_1);
+        break;
+      case 2:
+        SYNC_WFE(s3_3_c15_c15_2);
+        break;
+      case 3:
+        SYNC_WFE(s3_3_c15_c15_3);
+        break;
+      default:
+        // should not happen
+        KMP_ASSERT(0);
+        break;
+      }
+    } else {
+      switch (window) {
+      case 0:
+        SYNC(s3_3_c15_c15_0);
+        break;
+      case 1:
+        SYNC(s3_3_c15_c15_1);
+        break;
+      case 2:
+        SYNC(s3_3_c15_c15_2);
+        break;
+      case 3:
+        SYNC(s3_3_c15_c15_3);
+        break;
+      default:
+        // should not happen
+        KMP_ASSERT(0);
+        break;
+      }
+    }
+  } else {
+    uint64_t val = 0;
+    // updagte BST bit
+    switch (window) {
+    case 0:
+      UPDATE_BST(s3_3_c15_c15_0, val);
+      break;
+    case 1:
+      UPDATE_BST(s3_3_c15_c15_1, val);
+      break;
+    case 2:
+      UPDATE_BST(s3_3_c15_c15_2, val);
+      break;
+    case 3:
+      UPDATE_BST(s3_3_c15_c15_3, val);
+      break;
+    default:
+      // should not happen
+      KMP_ASSERT(0);
+      break;
+    }
+    KA_TRACE(50, ("hardBarrier::sync_with_task: T#%d(%d:%d) new bst: %d, "
+                  "final_spin: %d\n",
+                  gtid, this_thr->th.th_team->t.t_id, tid, val, final_spin));
+
+    kmp_task_team_t *task_team = this_thr->th.th_task_team;
+    int tasks_completed = FALSE;
+    uint64_t completed = 0;
+    do {
+      // execute tasks
+      if (task_team != NULL) {
+        if (TCR_SYNC_4(task_team->tt.tt_active)) {
+          if (KMP_TASKING_ENABLED(task_team)) {
+            if (final_spin) {
+              do {
+                __kmp_atomic_execute_tasks_64(
+                    this_thr, gtid, (kmp_atomic_flag_64<> *)NULL, final_spin,
+                    &tasks_completed USE_ITT_BUILD_ARG(itt_sync_obj), 0);
+              } while (!tasks_completed);
+            } else {
+              __kmp_atomic_execute_tasks_64(
+                  this_thr, gtid, (kmp_atomic_flag_64<> *)NULL, final_spin,
+                  &tasks_completed USE_ITT_BUILD_ARG(itt_sync_obj), 0);
+            }
+          } else
+            this_thr->th.th_reap_state = KMP_SAFE_TO_REAP;
+        } else {
+          KMP_DEBUG_ASSERT(!KMP_MASTER_TID(this_thr->th.th_info.ds.ds_tid));
+#if OMPT_SUPPORT
+          // task-team is done now, other cases should be catched above
+          if (final_spin && ompt_enabled.enabled)
+            __ompt_implicit_task_end(this_thr, ompt_entry_state, tId);
+#endif
+          this_thr->th.th_task_team = NULL;
+          this_thr->th.th_reap_state = KMP_SAFE_TO_REAP;
+          task_team = NULL;
+        }
+      } else {
+        this_thr->th.th_reap_state = KMP_SAFE_TO_REAP;
+      }
+
+      if (TCR_4(__kmp_global.g.g_done)) {
+        if (__kmp_global.g.g_abort)
+          __kmp_abort_thread();
+      }
+
+#if KMP_STATS_ENABLED
+      // Check if thread has been signalled to idle state
+      // This indicates that the logical "join-barrier" has finished
+      if (this_thr->th.th_stats->isIdle() &&
+          KMP_GET_THREAD_STATE() == FORK_JOIN_BARRIER) {
+        KMP_SET_THREAD_STATE(IDLE);
+        KMP_PUSH_PARTITIONED_TIMER(OMP_idle);
+      }
+#endif
+
+      if (__kmp_dflt_blocktime == KMP_MAX_BLOCKTIME ||
+          ((task_team != NULL) && TCR_4(task_team->tt.tt_found_tasks))) {
+        // if user requests busy loop or remaining tasks exist,
+        // do not sleep by wfe
+        switch (window) {
+        case 0:
+          CHECK_LBSY(s3_3_c15_c15_0, val, completed);
+          break;
+        case 1:
+          CHECK_LBSY(s3_3_c15_c15_1, val, completed);
+          break;
+        case 2:
+          CHECK_LBSY(s3_3_c15_c15_2, val, completed);
+          break;
+        case 3:
+          CHECK_LBSY(s3_3_c15_c15_3, val, completed);
+          break;
+        }
+      } else {
+        switch (window) {
+        case 0:
+          CHECK_LBSY_WFE(s3_3_c15_c15_0, val, completed);
+          break;
+        case 1:
+          CHECK_LBSY_WFE(s3_3_c15_c15_1, val, completed);
+          break;
+        case 2:
+          CHECK_LBSY_WFE(s3_3_c15_c15_2, val, completed);
+          break;
+        case 3:
+          CHECK_LBSY_WFE(s3_3_c15_c15_3, val, completed);
+          break;
+        }
+      }
+    } while (!completed);
+  }
+
+#if OMPT_SUPPORT
+  ompt_state_t ompt_exit_state = this_thr->th.ompt_thread_info.state;
+  if (ompt_enabled.enabled && ompt_exit_state != ompt_state_undefined) {
+#if OMPT_OPTIONAL
+    if (final_spin) {
+      __ompt_implicit_task_end(this_thr, ompt_exit_state, tId);
+      ompt_exit_state = this_thr->th.ompt_thread_info.state;
+    }
+#endif
+    if (ompt_exit_state == ompt_state_idle) {
+      this_thr->th.ompt_thread_info.state = ompt_state_overhead;
+    }
+  }
+#endif
+#if KMP_STATS_ENABLED
+  // If we were put into idle state, pop that off the state stack
+  if (KMP_GET_THREAD_STATE() == IDLE) {
+    KMP_POP_PARTITIONED_TIMER();
+    KMP_SET_THREAD_STATE(thread_state);
+    this_thr->th.th_stats->resetIdleFlag();
+  }
+#endif
+}
+
+static void __kmp_hard_barrier_gather(
+    enum barrier_type bt, kmp_info_t *this_thr, int gtid, int tid,
+    void (*reduce)(void *, void *) USE_ITT_BUILD_ARG(void *itt_sync_obj)) {
+  KMP_TIME_DEVELOPER_PARTITIONED_BLOCK(KMP_hard_gather);
+  kmp_team_t *team = this_thr->th.th_team;
+  kmp_info_t **other_threads = team->t.t_threads;
+
+  KA_TRACE(20, ("__kmp_hard_barrier_gather: T#%d(%d:%d) enter for "
+                "barrier type %d\n",
+                gtid, team->t.t_id, tid, bt));
+  KMP_DEBUG_ASSERT(this_thr == other_threads[this_thr->th.th_info.ds.ds_tid]);
+
+  // Optimized route for intra-group only barrier in plain barrier.
+  // Release barrier (one synchronization) is enough in that case
+  // if no tasking. When tasking is enabled, workers still need to wait
+  // the primary to setup task team in gather barrier
+  if (bt == bs_plain_barrier && __kmp_tasking_mode == tskm_immediate_exec &&
+      team->t.h && team->t.h->is_barrier_allocated() && !team->t.h->is_hybrid) {
+    KMP_DEBUG_ASSERT(reduce == NULL);
+    KA_TRACE(20, ("__kmp_hard_barrier_gather: T#%d(%d:%d) skip barrier in"
+                  "no tasking mode\n",
+                  gtid, team->t.t_id, tid));
+    return;
+  }
+
+  if (!team->t.h || !team->t.h->is_barrier_allocated()) {
+    // fallback to soft barrier
+    KA_TRACE(20, ("__kmp_hard_barrier_gather: T#%d(%d:%d) fall back to hyper\n",
+                  gtid, team->t.t_id, tid));
+    return __kmp_hyper_barrier_gather(bt, this_thr, gtid, tid,
+                                      reduce USE_ITT_BUILD_ARG(itt_sync_obj));
+  }
+
+  if (team->t.h->is_hybrid) {
+    // sync within group first
+    team->t.h->sync(this_thr, FALSE, gtid, tid USE_ITT_BUILD_ARG(itt_sync_obj));
+
+    // then, group leader sync using soft barrier
+    // (simple linear barrier scheme for now)
+    if (team->t.h->is_group_leader(tid)) {
+      if (KMP_MASTER_TID(tid)) {
+        // reduce in my group
+        if (reduce) {
+          OMPT_REDUCTION_DECL(this_thr, gtid);
+          OMPT_REDUCTION_BEGIN;
+          // reduce in my group
+          int group = team->t.h->get_group_from_tid(tid);
+          for (int i = 1; i < team->t.h->threads_in_group[group]; i++) {
+            int child_tid = tid + i;
+            kmp_info_t *child_thr = other_threads[child_tid];
+            (*reduce)(this_thr->th.th_local.reduce_data,
+                      child_thr->th.th_local.reduce_data);
+          }
+          OMPT_REDUCTION_END;
+        }
+
+        // wait and reduce other group leader
+        kmp_balign_team_t *team_bar = &team->t.t_bar[bt];
+        kmp_uint64 new_state = team_bar->b_arrived + KMP_BARRIER_STATE_BUMP;
+        for (int i = 1; i < team->t.h->num_groups; i++) {
+          int child_tid = team->t.h->get_tid_of_group_leader(i);
+          kmp_flag_64<> flag(
+              &other_threads[child_tid]->th.th_bar[bt].bb.b_arrived, new_state);
+          flag.wait(this_thr, FALSE USE_ITT_BUILD_ARG(itt_sync_obj));
+          if (reduce) {
+            OMPT_REDUCTION_DECL(this_thr, gtid);
+            OMPT_REDUCTION_BEGIN;
+            (*reduce)(this_thr->th.th_local.reduce_data,
+                      other_threads[child_tid]->th.th_local.reduce_data);
+            OMPT_REDUCTION_END;
+          }
+        }
+        team_bar->b_arrived = new_state;
+      } else {
+        if (reduce) {
+          OMPT_REDUCTION_DECL(this_thr, gtid);
+          OMPT_REDUCTION_BEGIN;
+          // reduce in my group
+          int group = team->t.h->get_group_from_tid(tid);
+          for (int i = 1; i < team->t.h->threads_in_group[group]; i++) {
+            int child_tid = tid + i;
+            kmp_info_t *child_thr = other_threads[child_tid];
+            (*reduce)(this_thr->th.th_local.reduce_data,
+                      child_thr->th.th_local.reduce_data);
+          }
+          OMPT_REDUCTION_END;
+        }
+        // mark arrival to primary thread
+        kmp_bstate_t *thr_bar = &this_thr->th.th_bar[bt].bb;
+        kmp_flag_64<> flag(&thr_bar->b_arrived, other_threads[0]);
+        flag.release();
+      }
+    }
+
+    KA_TRACE(20,
+             ("__kmp_hard_barrier_gather: T#%d(%d:%d) exit hybrid barrier for "
+              "barrier type %d\n",
+              gtid, team->t.t_id, tid, bt));
+    return;
+  }
+
+  // non-hybrid barrier case. just sync within group
+  team->t.h->sync(this_thr, FALSE, gtid, tid USE_ITT_BUILD_ARG(itt_sync_obj));
+
+  if (KMP_MASTER_TID(tid)) {
+    // primary performes all reduce operation
+    if (reduce) {
+      OMPT_REDUCTION_DECL(this_thr, gtid);
+      OMPT_REDUCTION_BEGIN;
+      for (int child_tid = 1; child_tid < team->t.t_nproc; child_tid++) {
+        kmp_info_t *child_thr = other_threads[child_tid];
+        (*reduce)(this_thr->th.th_local.reduce_data,
+                  child_thr->th.th_local.reduce_data);
+      }
+      OMPT_REDUCTION_END;
+    }
+  }
+
+  KA_TRACE(20, ("__kmp_hard_barrier_gather: T#%d(%d:%d) exit for "
+                "barrier type %d\n",
+                gtid, team->t.t_id, tid, bt));
+}
+
+static void __kmp_hard_barrier_release(
+    enum barrier_type bt, kmp_info_t *this_thr, int gtid, int tid,
+    int propagate_icvs USE_ITT_BUILD_ARG(void *itt_sync_obj)) {
+  KMP_TIME_DEVELOPER_PARTITIONED_BLOCK(KMP_hard_release);
+  kmp_bstate_t *thr_bar;
+  kmp_team_t *team;
+
+  KA_TRACE(20, ("__kmp_hard_barrier_release: T#%d(%d:%d)"
+                "enter for barrier type %d\n",
+                gtid, NULL, tid, bt));
+  thr_bar = &this_thr->th.th_bar[bt].bb;
+
+  // If this is not a fork barrier, everything is already set up.
+  // Provide the optimized route for intra-group only barrier which performs
+  // best
+  if (bt != bs_forkjoin_barrier) {
+    team = this_thr->th.th_team;
+    if (team->t.h && team->t.h->is_barrier_allocated() &&
+        !team->t.h->is_hybrid) {
+      team->t.h->sync(this_thr, TRUE, gtid,
+                      tid USE_ITT_BUILD_ARG(itt_sync_obj));
+      return;
+    }
+  }
+
+  if (!KMP_MASTER_TID(tid)) {
+    // workers and non-master group leaders need to check their presence in team
+    do {
+      KA_TRACE(
+          20,
+          ("__kmp_hard_barrier_release: T#%d(%d:%d) worker. wait for team is "
+           "set up.  th_used_in_team: %d\n",
+           gtid, NULL, tid, this_thr->th.th_used_in_team.load()));
+      // if this thread is not in team yet
+      if (this_thr->th.th_used_in_team.load() != 1 &&
+          this_thr->th.th_used_in_team.load() != 3 &&
+          this_thr->th.th_used_in_team.load() != 4) {
+
+        // wait th_used_in_team will become 3 (by master in __kmp_add_threads)
+        kmp_flag_32<false, false> my_flag(&(this_thr->th.th_used_in_team), 3);
+        if (KMP_COMPARE_AND_STORE_ACQ32(&(this_thr->th.th_used_in_team), 2,
+                                        0) ||
+            this_thr->th.th_used_in_team.load() == 0) {
+          my_flag.wait(this_thr, true USE_ITT_BUILD_ARG(itt_sync_obj));
+        }
+        if (bt == bs_forkjoin_barrier && TCR_4(__kmp_global.g.g_done))
+          return;
+      }
+
+      if (this_thr->th.th_used_in_team.load() != 1 &&
+          this_thr->th.th_used_in_team.load() != 3 &&
+          this_thr->th.th_used_in_team.load() != 4) // spurious wake-up?
+        continue;
+      if (bt == bs_forkjoin_barrier && TCR_4(__kmp_global.g.g_done))
+        return;
+
+      tid = __kmp_tid_from_gtid(gtid);
+      team = this_thr->th.th_team;
+      KMP_DEBUG_ASSERT(tid >= 0);
+      KMP_DEBUG_ASSERT(team);
+      KA_TRACE(20, ("__kmp_hard_barrier_release: T#%d(%d:%d) worker. woke up\n",
+                    gtid, team, tid));
+
+      if (this_thr->th.th_used_in_team.load() == 3) {
+        KMP_COMPARE_AND_STORE_ACQ32(&(this_thr->th.th_used_in_team), 3, 1);
+      }
+      // if th_used_in_team is 4, then the team this thread currently belongs
+      // to will change the number of threads. We need to perform
+      // synchronization before that as hard barrier cannot wakeup a part of
+      // thread
+
+      // if hard barrier cannot be used, fallback to softbarrier
+      if (!team->t.h || !team->t.h->is_barrier_allocated()) {
+        KA_TRACE(20, ("__kmp_hard_barrier_release: T#%d(%d:%d) worker. fall "
+                      "back to hyper\n",
+                      gtid, team, tid));
+        __kmp_hyper_barrier_release(
+            bt, this_thr, gtid, tid,
+            propagate_icvs USE_ITT_BUILD_ARG(itt_sync_obj));
+        if (bt == bs_forkjoin_barrier && TCR_4(__kmp_global.g.g_done)) {
+          // master is waiting th_used_in_team to become 0 in kmp_reap_thread
+          KMP_COMPARE_AND_STORE_ACQ32(&(this_thr->th.th_used_in_team), 4, 0);
+          return;
+        }
+
+        // this thread will no longer belong to team
+        if (this_thr->th.th_used_in_team.load() == 4) {
+          KA_TRACE(20, ("__kmp_hard_barrier_release: T#%d(%d:%d) worker. this "
+                        "thread becomes unused\n",
+                        gtid, team, tid));
+          KMP_COMPARE_AND_STORE_ACQ32(&(this_thr->th.th_used_in_team), 4, 2);
+          continue;
+        }
+
+        return;
+      }
+
+      // if this is a fork barrier, allocate a barrier window for this thread
+      if (bt == bs_forkjoin_barrier) {
+        // setup affinity early since hard barrier requires it
+        if (this_thr->th.th_new_place != this_thr->th.th_current_place) {
+          __kmp_affinity_set_place(gtid);
+          // we should call __kmp_aux_display_affinity here but it will be
+          // resulted in displaying the affinity information twice (here and
+          // in __kmp_fork_barrier after this function returns). skip here.
+        }
+        team->t.h->get_window(this_thr, tid);
+      }
+
+      if (team->t.h->is_hybrid && team->t.h->is_group_leader(tid)) {
+        // group leader waits primary to wake me up
+        kmp_flag_64<> flag(&thr_bar->b_go, KMP_BARRIER_STATE_BUMP);
+        flag.wait(this_thr, TRUE USE_ITT_BUILD_ARG(itt_sync_obj));
+        if (bt == bs_forkjoin_barrier && TCR_4(__kmp_global.g.g_done))
+          return;
+        TCW_4(thr_bar->b_go, KMP_INIT_BARRIER_STATE);
+        KMP_MB();
+
+        // intra group sync
+        team->t.h->sync(this_thr, FALSE, gtid,
+                        tid USE_ITT_BUILD_ARG(itt_sync_obj));
+      } else {
+        // intra group sync
+        team->t.h->sync(this_thr, TRUE, gtid,
+                        tid USE_ITT_BUILD_ARG(itt_sync_obj));
+      }
+
+      if (bt == bs_forkjoin_barrier && TCR_4(__kmp_global.g.g_done))
+        return;
+
+      // check if this thread still belongs to the team
+      if (this_thr->th.th_used_in_team.load() == 1) {
+#if KMP_BARRIER_ICV_PUSH
+        if (propagate_icvs) {
+          __kmp_init_implicit_task(team->t.t_ident, team->t.t_threads[tid],
+                                   team, tid, FALSE);
+          // get icvs stored in team's struct
+          copy_icvs(&team->t.t_implicit_task_taskdata[tid].td_icvs,
+                    (kmp_internal_control_t *)team->t.h->team_icvs);
+          copy_icvs(&thr_bar->th_fixed_icvs,
+                    &team->t.t_implicit_task_taskdata[tid].td_icvs);
+        }
+#endif // KMP_BARRIER_ICV_PUSH
+       // success, exit from barrier
+        break;
+      }
+
+      if (this_thr->th.th_used_in_team.load() == 4) {
+        KA_TRACE(20, ("__kmp_hard_barrier_release: T#%d(%d:%d) worker. this "
+                      "thread becomes unused\n",
+                      gtid, team, tid));
+        KMP_COMPARE_AND_STORE_ACQ32(&(this_thr->th.th_used_in_team), 4, 2);
+      }
+      // next team may use soft barrier, reset status
+      for (int bs = 0; bs < bs_last_barrier; bs++) {
+        kmp_bstate_t *thr_bar = &this_thr->th.th_bar[bs].bb;
+        thr_bar->b_arrived = KMP_INIT_BARRIER_STATE;
+      }
+      // thread now becomes unused, retry from start
+    } while (1);
+  } else {
+    // primary
+    team = this_thr->th.th_team;
+    tid = __kmp_tid_from_gtid(gtid);
+    KA_TRACE(20, ("__kmp_hard_barrier_release: T#%d(%d:%d) primary.\n", gtid,
+                  team, tid));
+
+    // fallback to softbarrier;
+    if (!team->t.h || !team->t.h->is_barrier_allocated()) {
+      KA_TRACE(20, ("__kmp_hard_barrier_release: T#%d(%d:%d) primary. fallback "
+                    "to hyper\n",
+                    gtid, team, tid));
+      return __kmp_hyper_barrier_release(
+          bt, this_thr, gtid, tid,
+          propagate_icvs USE_ITT_BUILD_ARG(itt_sync_obj));
+    }
+
+    if (bt == bs_forkjoin_barrier) {
+      if (this_thr->th.th_new_place != this_thr->th.th_current_place) {
+        __kmp_affinity_set_place(gtid);
+      }
+      team->t.h->get_window(this_thr, tid);
+    }
+
+#if KMP_BARRIER_ICV_PUSH
+    if (propagate_icvs) {
+      __kmp_init_implicit_task(team->t.t_ident, team->t.t_threads[tid], team,
+                               tid, FALSE);
+      copy_icvs(&thr_bar->th_fixed_icvs,
+                &team->t.t_implicit_task_taskdata[tid].td_icvs);
+    }
+#endif
+
+    if (team->t.h->is_hybrid) {
+      // wakeup group leader
+      kmp_info_t **other_threads = team->t.t_threads;
+      for (int i = 1; i < team->t.h->num_groups; i++) {
+        int child_tid = team->t.h->get_tid_of_group_leader(i);
+        kmp_flag_64<> flag(&other_threads[child_tid]->th.th_bar[bt].bb.b_go,
+                           other_threads[child_tid]);
+        flag.release();
+      }
+    }
+
+    // intra group sync
+    team->t.h->sync(this_thr, TRUE, gtid, tid USE_ITT_BUILD_ARG(itt_sync_obj));
+  }
+
+  KA_TRACE(20, ("__kmp_hard_barrier_release: T#%d(%d:%d) exit for "
+                "barrier type %d\n",
+                gtid, team->t.t_id, tid, bt));
+}
+
+void __kmp_hard_barrier_wakeup_soft(kmp_info_t *master) {
+  __kmp_hyper_barrier_release(bs_forkjoin_barrier, master,
+                              __kmp_gtid_from_thread(master), 0,
+                              true USE_ITT_BUILD_ARG(NULL));
+}
+//*****************************************************//
 // End of Barrier Algorithms
 
 // type traits for cancellable value
@@ -1871,6 +2682,11 @@ static int __kmp_barrier_template(enum barrier_type bt, int gtid, int is_split,
                                   reduce USE_ITT_BUILD_ARG(itt_sync_obj));
         break;
       }
+      case bp_hard_bar: {
+        __kmp_hard_barrier_gather(bt, this_thr, gtid, tid,
+                                  reduce USE_ITT_BUILD_ARG(itt_sync_obj));
+        break;
+      }
       case bp_hyper_bar: {
         // don't set branch bits to 0; use linear
         KMP_ASSERT(__kmp_barrier_gather_branch_bits[bt]);
@@ -1987,6 +2803,11 @@ static int __kmp_barrier_template(enum barrier_type bt, int gtid, int is_split,
         case bp_dist_bar: {
           KMP_ASSERT(__kmp_barrier_release_branch_bits[bt]);
           __kmp_dist_barrier_release(bt, this_thr, gtid, tid,
+                                     FALSE USE_ITT_BUILD_ARG(itt_sync_obj));
+          break;
+        }
+        case bp_hard_bar: {
+          __kmp_hard_barrier_release(bt, this_thr, gtid, tid,
                                      FALSE USE_ITT_BUILD_ARG(itt_sync_obj));
           break;
         }
@@ -2143,6 +2964,11 @@ void __kmp_end_split_barrier(enum barrier_type bt, int gtid) {
                                    FALSE USE_ITT_BUILD_ARG(NULL));
         break;
       }
+      case bp_hard_bar: {
+        __kmp_hard_barrier_release(bt, this_thr, gtid, tid,
+                                   FALSE USE_ITT_BUILD_ARG(NULL));
+        break;
+      }
       default: {
         __kmp_linear_barrier_release(bt, this_thr, gtid, tid,
                                      FALSE USE_ITT_BUILD_ARG(NULL));
@@ -2273,6 +3099,11 @@ void __kmp_join_barrier(int gtid) {
   switch (__kmp_barrier_gather_pattern[bs_forkjoin_barrier]) {
   case bp_dist_bar: {
     __kmp_dist_barrier_gather(bs_forkjoin_barrier, this_thr, gtid, tid,
+                              NULL USE_ITT_BUILD_ARG(itt_sync_obj));
+    break;
+  }
+  case bp_hard_bar: {
+    __kmp_hard_barrier_gather(bs_forkjoin_barrier, this_thr, gtid, tid,
                               NULL USE_ITT_BUILD_ARG(itt_sync_obj));
     break;
   }
@@ -2467,6 +3298,11 @@ void __kmp_fork_barrier(int gtid, int tid) {
   case bp_dist_bar: {
     __kmp_dist_barrier_release(bs_forkjoin_barrier, this_thr, gtid, tid,
                                TRUE USE_ITT_BUILD_ARG(NULL));
+    break;
+  }
+  case bp_hard_bar: {
+    __kmp_hard_barrier_release(bs_forkjoin_barrier, this_thr, gtid, tid,
+                               TRUE USE_ITT_BUILD_ARG(itt_sync_obj));
     break;
   }
   case bp_hyper_bar: {

@@ -16,6 +16,7 @@
 #include "kmp_stats.h"
 #include "kmp_wait_release.h"
 #include "kmp_taskdeps.h"
+#include "kmp_barrier.h"
 
 #if OMPT_SUPPORT
 #include "ompt-specific.h"
@@ -583,6 +584,11 @@ static kmp_int32 __kmp_push_task(kmp_int32 gtid, kmp_task_t *task) {
                 "task=%p ntasks=%d head=%u tail=%u\n",
                 gtid, taskdata, thread_data->td.td_deque_ntasks,
                 thread_data->td.td_deque_head, thread_data->td.td_deque_tail));
+
+  if (__kmp_barrier_gather_pattern[bs_plain_barrier] == bp_hard_bar) {
+    // wakeup sleeping thread if any
+    hardBarrier::wakeup();
+  }
 
   __kmp_release_bootstrap_lock(&thread_data->td.td_deque_lock);
 
@@ -3261,7 +3267,7 @@ static inline int __kmp_execute_tasks_template(
       // proceed. If this thread is in the last spin loop in the barrier,
       // waiting to be released, we know that the termination condition will not
       // be satisfied, so don't waste any cycles checking it.
-      if (flag == NULL || (!final_spin && flag->done_check())) {
+      if (!final_spin && (flag == NULL || flag->done_check())) {
         KA_TRACE(
             15,
             ("__kmp_execute_tasks_template: T#%d spin condition satisfied\n",

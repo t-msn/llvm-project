@@ -4475,6 +4475,40 @@ static void __kmp_aux_affinity_initialize(void) {
   KMP_CPU_FREE_ARRAY(osId2Mask, maxIndex + 1);
 }
 
+// return true if affinity setting is eligible for hard barrier
+// i.e. each place contains only one core in succession
+bool __kmp_check_places_for_hard_barrier() {
+  int prev = -1;
+
+  KA_TRACE(20, ("__kmp_check_places_for_hard_barrier: enter. num_masks: %d\n",
+                __kmp_affinity_num_masks));
+
+  for (int i = 0; i < __kmp_affinity_num_masks; i++) {
+    kmp_affin_mask_t *mask = KMP_CPU_INDEX(__kmp_affinity_masks, i);
+
+    if (mask->count() != 1) {
+      KA_TRACE(20,
+               ("__kmp_check_places_for_hard_barrier: place %d has %d cores\n",
+                i, mask->count()));
+      return false;
+    }
+
+    int current = mask->begin();
+    if (prev != -1 && current != (prev + 1)) {
+      KA_TRACE(20, ("__kmp_check_places_for_hard_barrier: place %d is on core "
+                    "%d, not next to previous core %d\n",
+                    i, current, prev));
+      return false;
+    }
+
+    prev = current;
+  }
+
+  KA_TRACE(
+      20, ("__kmp_check_places_for_hard_barrier: eixt. ok for hard barrier\n"));
+  return true;
+}
+
 void __kmp_affinity_initialize(void) {
   // Much of the code above was written assuming that if a machine was not
   // affinity capable, then __kmp_affinity_type == affinity_none.  We now

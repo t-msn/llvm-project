@@ -13,6 +13,7 @@
 #include "kmp.h"
 #include "kmp_affinity.h"
 #include "kmp_atomic.h"
+#include "kmp_barrier.h"
 #include "kmp_environment.h"
 #include "kmp_error.h"
 #include "kmp_i18n.h"
@@ -110,6 +111,10 @@ kmp_info_t *__kmp_thread_pool_insert_pt = NULL;
 void __kmp_resize_dist_barrier(kmp_team_t *team, int old_nthreads,
                                int new_nthreads);
 void __kmp_add_threads_to_team(kmp_team_t *team, int new_nthreads);
+
+static void __kmp_resize_hard_barrier(kmp_team_t *team, kmp_info_t *master,
+                                      int new_nproc, int new_proc_bind,
+                                      bool force = false);
 
 /* Calculate the identifier of the current thread */
 /* fast (and somewhat portable) way to get unique identifier of executing
@@ -1011,6 +1016,15 @@ static void __kmp_fork_team_threads(kmp_root_t *root, kmp_team_t *team,
       __kmp_partition_places(team);
     }
 #endif
+    if (__kmp_barrier_gather_pattern[bs_forkjoin_barrier] == bp_hard_bar) {
+      // affinity is not setup for teams construct therefore we cannot use hard
+      // barrier for teams construct
+      if (!fork_teams_workers && team->t.t_nproc > 1) {
+        __kmp_resize_hard_barrier(team, master_th, team->t.t_nproc,
+                                  team->t.t_proc_bind);
+      }
+      __kmp_add_threads_to_team(team, team->t.t_nproc);
+    }
   }
 
   if (__kmp_display_affinity && team->t.t_display_affinity != 1) {
@@ -1350,6 +1364,45 @@ void __kmp_serialized_parallel(ident_t *loc, kmp_int32 global_tid) {
 #endif
 }
 
+// return true if hard barrier can be used for this team
+static bool __kmp_can_use_hard_barrier(kmp_team_t *team, kmp_info_t *master,
+                                       int nthreads, int proc_bind) {
+  // TODO: add support of KMP_AFFINITY
+  if (proc_bind != proc_bind_close) {
+    KA_TRACE(20, ("__kmp_can_use_hard_barrier: proc bind is not close: %d/%d\n",
+                  proc_bind, __kmp_affinity_type));
+    return false;
+  }
+
+  if (master->th.th_affin_mask->count() != 1) {
+    KA_TRACE(
+        20,
+        ("__kmp_can_use_hard_barrier: master affinity is not appropriate: %d\n",
+         master->th.th_affin_mask->count()));
+    return false;
+  }
+
+  int primary_core = master->th.th_affin_mask->begin();
+  if (((primary_core % hardBarrier::CORES_PER_GROUP) + nthreads) >
+      hardBarrier::CORES_PER_GROUP * hardBarrier::NUM_GROUPS) {
+    KA_TRACE(20, ("__kmp_can_use_hard_barrier: too many workers: %d/%d/%d\n",
+                  primary_core, nthreads, team->t.t_nproc));
+    return false;
+  }
+
+  if ((primary_core + nthreads) % hardBarrier::CORES_PER_GROUP == 1) {
+    KA_TRACE(20, ("__kmp_can_use_hard_barrier: each group needs at least 1 "
+                  "threads: %d/%d/%d\n",
+                  primary_core, nthreads, team->t.t_nproc));
+    return false;
+  }
+
+  KA_TRACE(20, ("__kmp_can_use_hard_barrier: hard barrier can be used for this "
+                "team:%p\n",
+                team));
+  return true;
+}
+
 /* most of the work for a fork */
 /* return true if we really went parallel, false if serialized */
 int __kmp_fork_call(ident_t *loc, int gtid,
@@ -1657,6 +1710,14 @@ int __kmp_fork_call(ident_t *loc, int gtid,
 #if KMP_AFFINITY_SUPPORTED
       __kmp_partition_places(parent_team);
 #endif
+
+      if (__kmp_barrier_gather_pattern[bs_forkjoin_barrier] == bp_hard_bar) {
+        // force resize since this team may be able to use hard barrier
+        __kmp_resize_hard_barrier(parent_team, parent_team->t.t_threads[0],
+                                  parent_team->t.t_nproc,
+                                  parent_team->t.t_proc_bind, true);
+        __kmp_add_threads_to_team(parent_team, parent_team->t.t_nproc);
+      }
 
       KF_TRACE(10, ("__kmp_fork_call: before internal fork: root=%p, team=%p, "
                     "master_th=%p, gtid=%d\n",
@@ -2051,6 +2112,8 @@ int __kmp_fork_call(ident_t *loc, int gtid,
                                  argc USE_NESTED_HOT_ARG(master_th));
       if (__kmp_barrier_release_pattern[bs_forkjoin_barrier] == bp_dist_bar)
         copy_icvs((kmp_internal_control_t *)team->t.b->team_icvs, &new_icvs);
+      if (__kmp_barrier_release_pattern[bs_forkjoin_barrier] == bp_hard_bar)
+        copy_icvs((kmp_internal_control_t *)team->t.h->team_icvs, &new_icvs);
     } else {
       /* allocate a new parallel team */
       KF_TRACE(10, ("__kmp_fork_call: before __kmp_allocate_team\n"));
@@ -2064,6 +2127,10 @@ int __kmp_fork_call(ident_t *loc, int gtid,
       if (__kmp_barrier_release_pattern[bs_forkjoin_barrier] == bp_dist_bar)
         copy_icvs((kmp_internal_control_t *)team->t.b->team_icvs,
                   &master_th->th.th_current_task->td_icvs);
+      if (__kmp_barrier_release_pattern[bs_forkjoin_barrier] == bp_hard_bar) {
+        copy_icvs((kmp_internal_control_t *)team->t.h->team_icvs,
+                  &master_th->th.th_current_task->td_icvs);
+      }
     }
     KF_TRACE(
         10, ("__kmp_fork_call: after __kmp_allocate_team - team = %p\n", team));
@@ -2400,6 +2467,12 @@ void __kmp_join_call(ident_t *loc, int gtid
     }
 #endif
 
+    if (__kmp_barrier_gather_pattern[bs_forkjoin_barrier] == bp_hard_bar &&
+        parent_team->t.h && parent_team->t.h->is_barrier_allocated()) {
+      // reset barrier window status for parent team
+      parent_team->t.h->get_window(master_th, 0);
+    }
+
     return;
   }
 
@@ -2434,6 +2507,10 @@ void __kmp_join_call(ident_t *loc, int gtid
     if (team->t.t_nproc > 1 &&
         __kmp_barrier_gather_pattern[bs_forkjoin_barrier] == bp_dist_bar) {
       team->t.b->update_num_threads(team->t.t_nproc);
+      __kmp_add_threads_to_team(team, team->t.t_nproc);
+    } else if (team->t.t_nproc > 1 &&
+               __kmp_barrier_gather_pattern[bs_forkjoin_barrier] ==
+                   bp_hard_bar) {
       __kmp_add_threads_to_team(team, team->t.t_nproc);
     }
   }
@@ -2602,6 +2679,10 @@ void __kmp_join_call(ident_t *loc, int gtid
   master_th->th.th_team_nproc = parent_team->t.t_nproc;
   master_th->th.th_team_master = parent_team->t.t_threads[0];
   master_th->th.th_team_serialized = parent_team->t.t_serialized;
+  if (__kmp_barrier_gather_pattern[bs_forkjoin_barrier] == bp_hard_bar &&
+      parent_team->t.h && parent_team->t.h->is_barrier_allocated()) {
+    parent_team->t.h->get_window(master_th, 0);
+  }
 
   /* restore serialized team, if need be */
   if (parent_team->t.t_serialized &&
@@ -2729,6 +2810,10 @@ void __kmp_set_num_threads(int new_nth, int gtid) {
     if (__kmp_barrier_release_pattern[bs_forkjoin_barrier] == bp_dist_bar) {
       __kmp_resize_dist_barrier(hot_team, hot_team->t.t_nproc, new_nth);
     }
+    if (__kmp_barrier_gather_pattern[bs_forkjoin_barrier] == bp_hard_bar) {
+      __kmp_resize_hard_barrier(hot_team, hot_team->t.t_threads[0], new_nth,
+                                hot_team->t.t_proc_bind);
+    }
     // Release the extra threads we don't need any more.
     for (f = new_nth; f < hot_team->t.t_nproc; f++) {
       KMP_DEBUG_ASSERT(hot_team->t.t_threads[f] != NULL);
@@ -2750,6 +2835,9 @@ void __kmp_set_num_threads(int new_nth, int gtid) {
 
     if (__kmp_barrier_release_pattern[bs_forkjoin_barrier] == bp_dist_bar) {
       hot_team->t.b->update_num_threads(new_nth);
+      __kmp_add_threads_to_team(hot_team, new_nth);
+    } else if (__kmp_barrier_release_pattern[bs_forkjoin_barrier] ==
+               bp_hard_bar) {
       __kmp_add_threads_to_team(hot_team, new_nth);
     }
 
@@ -4369,7 +4457,10 @@ kmp_info_t *__kmp_allocate_thread(kmp_root_t *root, kmp_team_t *team,
     new_thr->th.th_task_state_top = 0;
     new_thr->th.th_task_state_stack_sz = 4;
 
-    if (__kmp_barrier_gather_pattern[bs_forkjoin_barrier] == bp_dist_bar) {
+    if (__kmp_barrier_gather_pattern[bs_forkjoin_barrier] == bp_dist_bar ||
+        (__kmp_barrier_gather_pattern[bs_forkjoin_barrier] == bp_hard_bar &&
+         new_thr->th.th_team->t.h &&
+         new_thr->th.th_team->t.h->is_barrier_allocated())) {
       // Make sure pool thread has transitioned to waiting on own thread struct
       KMP_DEBUG_ASSERT(new_thr->th.th_used_in_team.load() == 0);
       // Thread activated in __kmp_allocate_team when increasing team size
@@ -5058,6 +5149,117 @@ static void __kmp_partition_places(kmp_team_t *team, int update_master_only) {
 
 #endif // KMP_AFFINITY_SUPPORTED
 
+// check if we can use hard barrier in this team and setup bb.
+// otherwise just fallback to use soft barrier
+static void __kmp_resize_hard_barrier(kmp_team_t *team, kmp_info_t *master,
+                                      int new_nproc, int new_proc_bind,
+                                      bool force) {
+
+  int old_nproc = team->t.t_nproc;
+
+  KA_TRACE(10, ("__kmp_resize_hard_barrier: enter T#%d, nthreads: %d -> %d, "
+                "proc_bind %d -> %d\n",
+                team->t.t_id, team->t.t_nproc, new_nproc, team->t.t_proc_bind,
+                new_proc_bind));
+
+  // below logic is mostly the same as distribution barrier
+  if (force || (old_nproc > 1 && old_nproc != new_nproc)) {
+    if (team->t.h->is_barrier_allocated()) {
+      // set all workers to transition state
+      for (int f = 1; f < old_nproc; ++f) {
+        KMP_DEBUG_ASSERT(team->t.t_threads[f] != NULL);
+        // Ignore threads that are already inactive or not present in the team
+        if (team->t.t_threads[f]->th.th_used_in_team.load() == 0) {
+          // teams construct causes thread_limit to get passed in, and some of
+          // those could be inactive; just ignore them
+          continue;
+        }
+        // If thread is transitioning still to in_use state, wait for it
+        if (team->t.t_threads[f]->th.th_used_in_team.load() == 3) {
+          while (team->t.t_threads[f]->th.th_used_in_team.load() == 3)
+            KMP_CPU_PAUSE();
+        }
+        // The thread should be in_use now
+        KMP_DEBUG_ASSERT(team->t.t_threads[f]->th.th_used_in_team.load() == 1);
+        // Transition to unused state (but sync before leaving)
+        team->t.t_threads[f]->th.th_used_in_team.store(4);
+      }
+
+      // wakeup old thread waiting in release barrier
+      KA_TRACE(20,
+               ("__kmp_resize_hard_barrier: T#%d, wake up old hard barrier\n",
+                team->t.t_id));
+      if (team->t.h->is_hybrid) {
+        for (int i = 1; i < team->t.h->num_groups; i++) {
+          int child_tid = team->t.h->get_tid_of_group_leader(i);
+          kmp_flag_64<> flag(&team->t.t_threads[child_tid]
+                                  ->th.th_bar[bs_forkjoin_barrier]
+                                  .bb.b_go,
+                             team->t.t_threads[child_tid]);
+          flag.release();
+        }
+      }
+      team->t.h->sync(master, FALSE, 0, 0 USE_ITT_BUILD_ARG(NULL));
+
+      // next team may use soft barrier, reset status
+      for (int bs = 0; bs < bs_last_barrier; bs++) {
+        kmp_balign_team_t *team_bar = &team->t.t_bar[bs];
+        team_bar->b_arrived = KMP_INIT_BARRIER_STATE;
+      }
+    } else {
+      // thread is sleeping in softbarrier
+      for (int f = 1; f < old_nproc; ++f) {
+        team->t.t_threads[f]->th.th_used_in_team.store(4);
+      }
+      KA_TRACE(20,
+               ("__kmp_resize_hard_barrier: T#%d, wake up old soft barrier\n",
+                team->t.t_id));
+
+      // XXX: it seems master->th.th_team points task_team at this point.
+      // is there any better way to handle this?
+      int temp = master->th.th_team_nproc;
+      kmp_team_t *temp_team = master->th.th_team;
+      master->th.th_team_nproc = team->t.t_nproc;
+      master->th.th_team = team;
+      __kmp_hard_barrier_wakeup_soft(master);
+      master->th.th_team_nproc = temp;
+      master->th.th_team = temp_team;
+    }
+
+    // wait for threads to be removed from team
+    for (int f = 1; f < old_nproc; ++f) {
+      while (team->t.t_threads[f]->th.th_used_in_team.load() != 0)
+        KMP_CPU_PAUSE();
+    }
+  }
+
+  // resize main logic
+  if (team->t.h->is_barrier_allocated() && team->t.t_nproc == new_nproc &&
+      team->t.t_proc_bind == new_proc_bind) {
+    KA_TRACE(10, ("__kmp_resize_hard_barrier: T#%d, hard barrier is alredy set "
+                  "up for team\n",
+                  team->t.t_id));
+  } else {
+    if (__kmp_can_use_hard_barrier(team, master, new_nproc, new_proc_bind) &&
+        team->t.h->barrier_alloc(master, new_nproc) == 0) {
+      KA_TRACE(10, ("__kmp_resize_hard_barrier: T#%d, allocate hard barrier. "
+                    "nthreads: %d, "
+                    "proc_bind: %d\n",
+                    team->t.t_id, new_nproc, new_proc_bind));
+    } else {
+      // in some case this is expected (i.e. outer team of nested parallelism
+      // if OMP_PROC_BIND=spread,close is used)
+      KMP_INFORM(HardBarrierCannotBeUsed);
+      team->t.h->barrier_free();
+      KA_TRACE(
+          10,
+          ("__kmp_resize_hard_barrier: T#%d, cannot use hard barrier. use soft "
+           "barrier. nthreads: %d, proc_bind: %d\n",
+           team->t.t_id, new_nproc, new_proc_bind));
+    }
+  }
+}
+
 /* allocate a new team data structure to use.  take one off of the free pool if
    available */
 kmp_team_t *
@@ -5136,6 +5338,19 @@ __kmp_allocate_team(kmp_root_t *root, int new_nproc, int max_nproc,
       // Distributed barrier may need a resize
       int old_nthr = team->t.t_nproc;
       __kmp_resize_dist_barrier(team, old_nthr, new_nproc);
+    }
+
+    if (__kmp_barrier_gather_pattern[bs_forkjoin_barrier] == bp_hard_bar) {
+      if (!team->t.h) {
+        // See comments in hardBarrier::allocate() for why this is needed
+        team->t.h = hardBarrier::allocate();
+      }
+      // if do_place_partion == 0 then this team cannot use hard barrier
+      // since affinity will not be set up for this team. Skip hard barrier
+      // initialization and use software barrier
+      if (do_place_partition) {
+        __kmp_resize_hard_barrier(team, master, new_nproc, new_proc_bind);
+      }
     }
 
     // If not doing the place partition, then reset the team's proc bind
@@ -5266,6 +5481,12 @@ __kmp_allocate_team(kmp_root_t *root, int new_nproc, int max_nproc,
 #if KMP_AFFINITY_SUPPORTED
         __kmp_partition_places(team);
 #endif
+      }
+
+      if (__kmp_barrier_release_pattern[bs_forkjoin_barrier] == bp_hard_bar) {
+        // call __kmp_add_thread_to_team after __kmp_partition_places
+        // since hard barrier needs affinity
+        __kmp_add_threads_to_team(team, new_nproc);
       }
     } else { // team->t.t_nproc < new_nproc
 #if (KMP_OS_LINUX || KMP_OS_FREEBSD) && KMP_AFFINITY_SUPPORTED
@@ -5408,6 +5629,12 @@ __kmp_allocate_team(kmp_root_t *root, int new_nproc, int max_nproc,
         __kmp_partition_places(team);
 #endif
       }
+
+      if (__kmp_barrier_release_pattern[bs_forkjoin_barrier] == bp_hard_bar) {
+        // call __kmp_add_thread_to_team after __kmp_partition_places
+        // since hard barrier needs affinity
+        __kmp_add_threads_to_team(team, new_nproc);
+      }
     } // Check changes in number of threads
 
     kmp_info_t *master = team->t.t_threads[0];
@@ -5480,6 +5707,13 @@ __kmp_allocate_team(kmp_root_t *root, int new_nproc, int max_nproc,
         }
       }
 
+      if (max_nproc > 1 &&
+          __kmp_barrier_gather_pattern[bs_plain_barrier] == bp_hard_bar) {
+        if (!team->t.h) {
+          team->t.h = hardBarrier::allocate();
+        }
+      }
+
       /* setup the team for fresh use */
       __kmp_initialize_team(team, new_nproc, new_icvs, NULL);
 
@@ -5539,6 +5773,12 @@ __kmp_allocate_team(kmp_root_t *root, int new_nproc, int max_nproc,
       __kmp_barrier_gather_pattern[bs_forkjoin_barrier] == bp_dist_bar) {
     // Allocate barrier structure
     team->t.b = distributedBarrier::allocate(__kmp_dflt_team_nth_ub);
+  }
+
+  // if max_nproc == 1 then there is no need to use barrier at all
+  if (max_nproc > 1 &&
+      __kmp_barrier_gather_pattern[bs_plain_barrier] == bp_hard_bar) {
+    team->t.h = hardBarrier::allocate();
   }
 
   /* NOTE well, for some reason allocating one big buffer and dividing it up
@@ -5702,7 +5942,10 @@ void __kmp_free_team(kmp_root_t *root,
         KMP_COMPARE_AND_STORE_ACQ32(&(team->t.t_threads[f]->th.th_used_in_team),
                                     1, 2);
       }
-      __kmp_free_thread(team->t.t_threads[f]);
+      if (__kmp_barrier_gather_pattern[bs_forkjoin_barrier] == bp_hard_bar) {
+        KMP_COMPARE_AND_STORE_ACQ32(&(team->t.t_threads[f]->th.th_used_in_team),
+                                    1, 4);
+      }
     }
 
     if (__kmp_barrier_gather_pattern[bs_forkjoin_barrier] == bp_dist_bar) {
@@ -5726,7 +5969,52 @@ void __kmp_free_team(kmp_root_t *root,
       }
     }
 
+    if (__kmp_barrier_gather_pattern[bs_forkjoin_barrier] == bp_hard_bar) {
+      if (team->t.h && team->t.h->is_barrier_allocated()) {
+        // wakeup sleeping threads
+        if (team->t.h->is_hybrid) {
+          for (int i = 1; i < team->t.h->num_groups; i++) {
+            int child_tid = team->t.h->get_tid_of_group_leader(i);
+            kmp_flag_64<> flag(&team->t.t_threads[child_tid]
+                                    ->th.th_bar[bs_forkjoin_barrier]
+                                    .bb.b_go,
+                               team->t.t_threads[child_tid]);
+            flag.release();
+          }
+        }
+#if KMP_NESTED_HOT_TEAMS
+        if (team->t.t_threads[0]->th.th_hot_teams) {
+          // If nested hot teams is used, __kmp_free_hot_teams will call
+          // this function in for loop during final cleanup and therefore
+          // current affinity may not match the primary thread's affinity
+          // for this team. Restore the affinity to perform below sync
+          int gtid = team->t.t_threads[0]->th.th_info.ds.ds_gtid;
+          __kmp_affinity_set_place(gtid);
+        }
+#endif
+        team->t.h->sync(team->t.t_threads[0], FALSE, 0,
+                        0 USE_ITT_BUILD_ARG(NULL));
+      } else {
+        // same comments as in __kmp_can_use_hard_barrier
+        int temp_nproc = team->t.t_threads[0]->th.th_team_nproc;
+        kmp_team_t *temp_team = team->t.t_threads[0]->th.th_team;
+
+        team->t.t_threads[0]->th.th_team_nproc = team->t.t_nproc;
+        team->t.t_threads[0]->th.th_team = team;
+        __kmp_hard_barrier_wakeup_soft(team->t.t_threads[0]);
+        team->t.t_threads[0]->th.th_team_nproc = temp_nproc;
+        team->t.t_threads[0]->th.th_team = temp_team;
+      }
+
+      // Wait for threads to be removed from team
+      for (int f = 1; f < team->t.t_nproc; ++f) {
+        while (team->t.t_threads[f]->th.th_used_in_team.load() != 0)
+          KMP_CPU_PAUSE();
+      }
+    }
+
     for (f = 1; f < team->t.t_nproc; ++f) {
+      __kmp_free_thread(team->t.t_threads[f]);
       team->t.t_threads[f] = NULL;
     }
 
@@ -5734,6 +6022,13 @@ void __kmp_free_team(kmp_root_t *root,
         __kmp_barrier_gather_pattern[bs_forkjoin_barrier] == bp_dist_bar) {
       distributedBarrier::deallocate(team->t.b);
       team->t.b = NULL;
+    }
+    if (team->t.t_max_nproc > 1 &&
+        __kmp_barrier_gather_pattern[bs_plain_barrier] == bp_hard_bar) {
+      if (team->t.h) {
+        hardBarrier::deallocate(team->t.h);
+        team->t.h = NULL;
+      }
     }
     /* put the team back in the team pool */
     /* TODO limit size of team pool, call reap_team if pool too large */
@@ -6133,7 +6428,8 @@ static void __kmp_reap_thread(kmp_info_t *thread, int is_root) {
       KA_TRACE(
           20, ("__kmp_reap_thread: releasing T#%d from fork barrier for reap\n",
                gtid));
-      if (__kmp_barrier_gather_pattern[bs_forkjoin_barrier] == bp_dist_bar) {
+      if (__kmp_barrier_gather_pattern[bs_forkjoin_barrier] == bp_dist_bar ||
+          __kmp_barrier_gather_pattern[bs_forkjoin_barrier] == bp_hard_bar) {
         while (
             !KMP_COMPARE_AND_STORE_ACQ32(&(thread->th.th_used_in_team), 0, 3))
           KMP_CPU_PAUSE();
@@ -7260,6 +7556,32 @@ static void __kmp_do_middle_initialize(void) {
   __kmp_affinity_initialize();
 
 #endif /* KMP_AFFINITY_SUPPORTED */
+
+  // If we cannot use hardware barrier at all, fallback to hyper barrier here
+  // As hardware barrier has some restriction on place setting and it will not
+  // change during runtime, check the condition after
+  // __kmp_affinity_initialize()
+  if (__kmp_barrier_release_pattern[bs_plain_barrier] == bp_hard_bar) {
+    bool fallback = false;
+
+    if (!hardBarrier::system_supports_hard_barrier()) {
+      KMP_WARNING(HardBarrierNotSupported,
+                  "System does not support hardware barrier");
+      fallback = true;
+    }
+    if (!__kmp_check_places_for_hard_barrier()) {
+      KMP_WARNING(HardBarrierNotSupported,
+                  "Place setting is not appropraite for hardware barrier");
+      fallback = true;
+    }
+
+    if (fallback) {
+      for (int i = bs_plain_barrier; i < bs_last_barrier; i++) {
+        __kmp_barrier_release_pattern[i] = bp_hyper_bar;
+        __kmp_barrier_gather_pattern[i] = bp_hyper_bar;
+      }
+    }
+  }
 
   KMP_ASSERT(__kmp_xproc > 0);
   if (__kmp_avail_proc == 0) {

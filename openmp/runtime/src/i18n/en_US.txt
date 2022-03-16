@@ -269,7 +269,7 @@ Using_int_Value              "%1$s value \"%2$d\" will be used."
 Using_uint_Value             "%1$s value \"%2$u\" will be used."
 Using_uint64_Value           "%1$s value \"%2$s\" will be used."
 Using_str_Value              "%1$s value \"%2$s\" will be used."
-BarrierPatternOverride       "Mixing other barrier patterns with dist is prohibited. Using dist for all barrier patterns."
+BarrierPatternOverride       "Mixing other barrier patterns with %1$s is prohibited. Using %1$s for all barrier patterns."
 MaxValueUsing                "%1$s maximum value \"%2$d\" will be used."
 MinValueUsing                "%1$s minimum value \"%2$d\" will be used."
 MemoryAllocFailed            "Memory allocation failed."
@@ -479,6 +479,8 @@ AffHWSubsetAttrInvalid       "KMP_HW_SUBSET ignored: %1$s: attribute value %2$s 
 AffHWSubsetAllFiltered       "KMP_HW_SUBSET ignored: all hardware resources would be filtered, please reduce the filter."
 AffHWSubsetAttrsNonHybrid    "KMP_HW_SUBSET ignored: Too many attributes specified. This machine is not a hybrid architecutre."
 AffHWSubsetIgnoringAttr      "KMP_HW_SUBSET: ignoring %1$s attribute. This machine is not a hybrid architecutre."
+HardBarrierNotSupported      "%1$s: Fallback to software barrier in this run entirely"
+HardBarrierCannotBeUsed      "Hard barrier cannot be used for this team. Fallback to software barrier"
 
 # --------------------------------------------------------------------------------------------------
 -*- HINTS -*-
